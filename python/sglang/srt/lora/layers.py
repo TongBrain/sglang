@@ -48,6 +48,27 @@ class BaseLayerWithLoRA(nn.Module):
     def set_lora_info(self, *args):
         pass
 
+    def set_lora_info_paged(self, A_pages: torch.Tensor, B_pages: torch.Tensor):
+        """Set paged LoRA weight storage for this module.
+
+        ``A_pages``: ``[total_pages, page_size * c, hidden]``
+        ``B_pages``: ``[total_pages, output_dim, page_size]``
+
+        The paged forward kernel is not yet implemented — calling this
+        stores the tensor references for future use.
+        """
+        self.set_lora = True
+        self.A_pages = A_pages
+        self.B_pages = B_pages
+
+    def _is_paged_mode(self) -> bool:
+        """True if this module uses paged (not flat-buffer) LoRA storage."""
+        return getattr(self, "A_pages", None) is not None
+
+    def _paged_forward_skip_lora(self) -> bool:
+        """Temporary: in paged mode, skip LoRA delta until B3 paged kernel."""
+        return self.set_lora and self._is_paged_mode()
+
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         pass
 
@@ -207,10 +228,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         ):
             base_output = self.extra_token_embedding(input_, base_output)
 
-        # Apply LoRA if configured
-        if self.set_lora:
-            # The backend's run_lora_a_embedding now handles both regular
-            # and extra tokens efficiently with CUDA graph support
+        # Apply LoRA if configured — skip for paged mode until B3 kernel
+        if self.set_lora and not self._paged_forward_skip_lora():
             base_output = self.apply_lora(base_output, input_, batch_info)
 
         return base_output
@@ -373,8 +392,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
         )
 
-        # Apply LoRA if set
-        if self.set_lora:
+        # Apply LoRA if set — skip for paged mode until B3 kernel
+        if self.set_lora and not self._paged_forward_skip_lora():
             base_output = self.apply_lora(base_output, hidden_states)
 
         return base_output
@@ -463,7 +482,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_, bias
         )
 
-        if self.set_lora:
+        if self.set_lora and not self._paged_forward_skip_lora():
             output_parallel = self.apply_lora(output_parallel, input_)
 
         if self.base_layer.gather_output:
@@ -731,7 +750,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             and not skip_all_reduce
         )
 
-        if self.set_lora and should_reduce:
+        if self.set_lora and should_reduce and not self._paged_forward_skip_lora():
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
                 input_parallel, self.A_buffer
             )
@@ -745,7 +764,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 base_output=output_,
             )
         else:
-            if self.set_lora:
+            if self.set_lora and not self._paged_forward_skip_lora():
                 output_parallel = self.apply_lora(output_parallel, input_parallel)
             if should_reduce:
                 output_ = tensor_model_parallel_all_reduce(output_parallel)
@@ -844,7 +863,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
     def forward(self, x: torch.Tensor):
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-        if self.set_lora:
+        if self.set_lora and not self._paged_forward_skip_lora():
             output = self.apply_lora(output, x)
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
@@ -1007,6 +1026,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         1. After gate_up projection, before activation
         2. After down projection, before final reduction
         """
+
+        # Paged mode: skip LoRA delta until paged MoE kernel is available (B4+)
+        if self._paged_forward_skip_lora():
+            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch
         lora_info = self._get_lora_info()

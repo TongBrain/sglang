@@ -78,6 +78,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.lora.lora_bucket_config import LoRABucketConfig
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -328,6 +329,12 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        if server_args.lora_rank_buckets and self.enable_lora:
+            self.lora_bucket_config = LoRABucketConfig.from_string(
+                server_args.lora_rank_buckets
+            )
+        else:
+            self.lora_bucket_config = None
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -2414,6 +2421,16 @@ class Scheduler(
 
         return ret
 
+    def _get_lora_rank(self, req) -> int:
+        if req.lora_id is None:
+            return 0
+        try:
+            return self.tp_worker.model_runner.lora_manager.loras[
+                req.lora_id
+            ].config.r
+        except KeyError:
+            return 0
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2504,10 +2521,27 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        bucket_ceiling = None
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
+
+            # Compute bucket ceiling lazily from the first schedulable request.
+            # _get_lora_rank is called once per iteration and reused.
+            # rank=0 (base model) gets ceiling bumped to the first non-zero
+            # bucket so that low-rank LoRA requests aren't blocked.
+            if self.lora_bucket_config is not None:
+                req_rank = self._get_lora_rank(req)
+                if req_rank > 0:
+                    if bucket_ceiling is None:
+                        bucket_ceiling = self.lora_bucket_config.get_ceiling(req_rank)
+                    elif req_rank > bucket_ceiling:
+                        continue
+                elif bucket_ceiling is None:
+                    # base model first → ceiling = first non-zero bucket
+                    bucket_ceiling = self.lora_bucket_config.get_ceiling(1)
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -2605,6 +2639,20 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
         )
+        if self.lora_bucket_config is not None:
+            new_batch.batch_max_rank = (
+                bucket_ceiling
+                if (bucket_ceiling is not None
+                   and bucket_ceiling != sys.maxsize)
+                else 0
+            )
+        else:
+            # Fallback: no bucket config → use actual max rank among
+            # scheduled requests.
+            new_batch.batch_max_rank = max(
+                (self._get_lora_rank(req) for req in can_run_list),
+                default=0,
+            )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
