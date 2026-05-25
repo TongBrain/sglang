@@ -529,11 +529,6 @@ class ServerArgs:
     lora_use_virtual_experts: bool = False
     lora_strict_loading: bool = False
     lora_drain_wait_threshold: float = 0.0
-    # LoRA rank bucketing: comma-separated sorted bucket boundaries for FCFS batching.
-    # Must include 0 (base model). Example: "0,8,16,32,64".
-    lora_rank_buckets: Optional[str] = None
-    # Page rank size for paged LoRA memory pool. 0 = disabled (use old MemoryPool).
-    lora_page_rank_size: int = 0
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -5270,24 +5265,6 @@ class ServerArgs:
             help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
         )
         parser.add_argument(
-            "--lora-rank-buckets",
-            default=ServerArgs.lora_rank_buckets,
-            type=str,
-            help="Comma-separated sorted bucket boundaries for LoRA rank-aware "
-            "FCFS batching. Must include 0 for base-model requests. "
-            'Default ("0,8,16,32,64") is applied when --enable-lora is set '
-            "and this option is not explicitly provided.",
-        )
-        parser.add_argument(
-            "--lora-page-rank-size",
-            default=ServerArgs.lora_page_rank_size,
-            type=int,
-            help="Page size (in rank dimension) for paged LoRA memory pool. "
-            "0 = disabled (use the existing contiguous LoRAMemoryPool). "
-            "When enabled (e.g. 8), the pool is organised as fixed-size pages "
-            "that are allocated and evicted individually, similar to paged attention.",
-        )
-        parser.add_argument(
             "--lora-target-modules",
             type=str,
             choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
@@ -7309,46 +7286,6 @@ class ServerArgs:
             assert (
                 self.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
-
-            # lora_rank_buckets: default is applied when LoRA is enabled and the
-            # user didn't set an explicit value (including explicitly to None/empty).
-            if self.lora_rank_buckets is None:
-                self.lora_rank_buckets = "0,8,16,32,64"
-            if self.lora_rank_buckets:
-                parts = [x.strip() for x in self.lora_rank_buckets.split(",")]
-                values = []
-                for p in parts:
-                    try:
-                        values.append(int(p))
-                    except ValueError:
-                        raise ValueError(
-                            f"--lora-rank-buckets must be comma-separated integers, "
-                            f"got '{self.lora_rank_buckets}'"
-                        )
-                if 0 not in values:
-                    raise ValueError(
-                        "--lora-rank-buckets must include 0 (for base-model requests). "
-                        f"Got: {self.lora_rank_buckets}"
-                    )
-                if sorted(set(values)) != values:
-                    raise ValueError(
-                        "--lora-rank-buckets must be sorted and contain no duplicates. "
-                        f"Got: {self.lora_rank_buckets}"
-                    )
-
-            # lora_page_rank_size: 0 = disabled, otherwise must be a power of 2 >= 8.
-            if self.lora_page_rank_size < 0:
-                raise ValueError(
-                    "--lora-page-rank-size must be >= 0. "
-                    f"Got: {self.lora_page_rank_size}"
-                )
-            if self.lora_page_rank_size > 0:
-                ps = self.lora_page_rank_size
-                if ps < 8 or (ps & (ps - 1)) != 0:
-                    raise ValueError(
-                        "--lora-page-rank-size must be 0 (disabled) or a power of 2 "
-                        f">= 8. Got: {ps}"
-                    )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:
