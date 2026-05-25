@@ -355,6 +355,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For LoRA
     lora_ids: Optional[List[str]] = None
+    batch_max_rank: int = 0  # bucket ceiling for kernel constexpr
+    page_table: Optional[torch.Tensor] = None  # paged-LoRA: [bs, max_pages_per_lora]
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -535,6 +537,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=[req.lora_id for req in batch.reqs],
+            batch_max_rank=batch.batch_max_rank,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
