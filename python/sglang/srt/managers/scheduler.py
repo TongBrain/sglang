@@ -163,26 +163,18 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import (
-    SchedulerDPAttnAdapter,
-)
-from sglang.srt.managers.scheduler_components.flush_wrapper import (
-    SchedulerFlushWrapper,
-)
+from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
 )
-from sglang.srt.managers.scheduler_components.ipc_channels import (
-    SchedulerIpcChannels,
-)
+from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
-from sglang.srt.managers.scheduler_components.load_inquirer import (
-    SchedulerLoadInquirer,
-)
+from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
@@ -328,6 +320,7 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.lora_base_priority = server_args.lora_base_priority
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -2414,6 +2407,22 @@ class Scheduler(
 
         return ret
 
+    @property
+    def lora_paged_pool(self):
+        """B2: Access the paged memory pool, or None if disabled."""
+        if not self.enable_lora:
+            return None
+        lora_mgr = self.tp_worker.model_runner.lora_manager
+        return lora_mgr.page_pool if lora_mgr.use_paged_pool else None
+
+    def _get_lora_rank(self, req) -> int:
+        if req.lora_id is None:
+            return 0
+        try:
+            return self.tp_worker.model_runner.lora_manager.loras[req.lora_id].config.r
+        except KeyError:
+            return 0
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2504,8 +2513,17 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        # Build iteration order: base-first if base-priority enabled
+        _base_priority = getattr(self, "lora_base_priority", False)
+        if _base_priority and self.enable_lora:
+            waiting_sorted = sorted(
+                self.waiting_queue, key=lambda r: 0 if r.lora_id is None else 1
+            )
+        else:
+            waiting_sorted = self.waiting_queue
+
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in waiting_sorted:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2605,6 +2623,10 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
         )
+        new_batch.batch_max_rank = max(
+            (self._get_lora_rank(req) for req in can_run_list),
+            default=0,
+        )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -2650,15 +2672,52 @@ class Scheduler(
 
         return new_batch
 
+    def _try_page_in_missing(self, req: Req, running_loras: set[Optional[str]]) -> bool:
+        """Try to page in missing pages for a LoRA adapter.
+
+        Called by _can_schedule_lora_req when an adapter is incomplete
+        (some pages were evicted). Evicts unprotected pages if needed,
+        then loads the missing pages. Running batch adapter pages are
+        protected from eviction.
+
+        Returns True if the adapter is complete after this call.
+        """
+        lora_mgr = self.tp_worker.model_runner.lora_manager
+        pool = lora_mgr.page_pool
+        rank = self._get_lora_rank(req)
+
+        if pool.is_complete(req.lora_id, rank):
+            return True
+
+        missing = pool.get_missing_pages(req.lora_id, rank)
+        free_count = len(pool.free_page_indices)
+
+        protected_uids = (running_loras | {req.lora_id}) - {None}
+        protected = pool.get_protected_pages(protected_uids)
+
+        if free_count < len(missing):
+            evicted = pool.evict_pages(len(missing) - free_count, protected)
+            if len(evicted) < len(missing) - free_count:
+                return False  # cannot evict enough pages
+
+        adapter = lora_mgr.loras[req.lora_id]
+        return pool.ensure_adapter_ready(
+            req.lora_id,
+            adapter,
+            protected,
+            lora_mgr.lora_modules,
+        )
+
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
     ) -> bool:
         """
         Check if a LoRA request can be scheduled.
 
-        This method checks two conditions:
+        This method checks three conditions:
         1. The drainer allows scheduling (based on draining state)
-        2. The LoRA adapter can be loaded (either already running or can be added)
+        2. The LoRA adapter can be loaded (validate_lora_batch: page budget + slot cap)
+        3. The LoRA adapter pages are complete (page-level check, B2; page-in if needed)
         """
         if self.lora_drainer and not self.lora_drainer.can_schedule(req):
             return False
@@ -2666,17 +2725,37 @@ class Scheduler(
         if req.lora_id in running_loras:
             return True
 
+        if self.lora_paged_pool is not None:
+            new_lora_set = {req.lora_id} | running_loras
+            if not self.tp_worker.model_runner.lora_manager.validate_lora_batch(
+                new_lora_set
+            ):
+                return False
+
+            if self.enable_lora_overlap_loading:
+                result = self.lora_overlap_loader.try_overlap_load_lora(
+                    req.lora_id, running_loras
+                )
+                return result
+
+            if not self.lora_paged_pool.is_complete(
+                req.lora_id, self._get_lora_rank(req)
+            ):
+                if not self._try_page_in_missing(req, running_loras):
+                    return False
+            return True
+
         if self.enable_lora_overlap_loading:
-            # For overlapping loading of LoRA weights with computation, we will load each
-            # adapter one at a time, as opposed to loading them in one batch
+            # Preserve the original flat-LoRA overlap-loading path: the overlap
+            # loader owns one-adapter-at-a-time admission/loading decisions.
             return self.lora_overlap_loader.try_overlap_load_lora(
                 req.lora_id, running_loras
             )
-        else:
-            new_lora_set = {req.lora_id} | running_loras
-            return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
-                new_lora_set
-            )
+
+        new_lora_set = {req.lora_id} | running_loras
+        return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
+            new_lora_set
+        )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""

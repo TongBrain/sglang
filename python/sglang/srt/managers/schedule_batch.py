@@ -1577,6 +1577,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
+    # LoRA bucket ceiling for kernel constexpr
+    batch_max_rank: int = 0
+
     @classmethod
     def init_new(
         cls,

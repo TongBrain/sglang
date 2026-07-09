@@ -54,12 +54,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    is_cuda,
-    is_hip,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -355,6 +350,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For LoRA
     lora_ids: Optional[List[str]] = None
+    batch_max_rank: int = 0  # bucket ceiling for kernel constexpr
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -535,6 +531,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=[req.lora_id for req in batch.reqs],
+            batch_max_rank=batch.batch_max_rank,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
@@ -658,7 +655,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not model_runner.server_args.enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                if not model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids)):
+                    raise RuntimeError(
+                        "fetch_new_loras failed: insufficient page budget for "
+                        f"lora_ids={set(ret.lora_ids)}"
+                    )
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 

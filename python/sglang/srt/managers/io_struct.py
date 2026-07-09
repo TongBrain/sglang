@@ -1972,6 +1972,25 @@ class LoRAMetrics:
     utilization: float = field(
         metadata={"metric": ("gauge", "LoRA pool utilization ratio")}
     )
+    # Paged LoRA eviction statistics (I7 metric)
+    eviction_events: int = field(
+        default=0, metadata={"metric": ("counter", "Total LoRA page eviction events")}
+    )
+    total_bytes_evicted: int = field(
+        default=0, metadata={"metric": ("counter", "Total LoRA bytes evicted")}
+    )
+    total_pages: int = field(
+        default=0, metadata={"metric": ("gauge", "Total LoRA page pool pages")}
+    )
+    used_pages: int = field(
+        default=0, metadata={"metric": ("gauge", "Used LoRA page pool pages")}
+    )
+    # Actual host->device bytes moved during swap-in (paged: bytes_paged_in,
+    # flat: bytes_loaded). Bandwidth constant => bytes ∝ I/O time. Paged-vs-flat
+    # ratio is the direct swap-cost comparison.
+    bytes_moved: int = field(
+        default=0, metadata={"metric": ("counter", "Actual LoRA swap-in bytes moved")}
+    )
 
 
 @dataclass

@@ -578,16 +578,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not self.enable_metrics:
-            return {}
-
-        state = {
+        return {
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
-        return state
 
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
@@ -972,7 +968,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.trace_slice(stage, self.last_forward_entry_time, ts)
 
     def get_queueing_time(self) -> float:
-        return self.forward_entry_time - self.wait_queue_entry_time
+        if self.wait_queue_entry_time <= 0.0 or self.forward_entry_time <= 0.0:
+            return 0.0
+        return max(0.0, self.forward_entry_time - self.wait_queue_entry_time)
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:

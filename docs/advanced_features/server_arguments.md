@@ -261,6 +261,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | `csgmv` | `triton`, `csgmv`, `ascend`, `torch_native` |
 | `--max-lora-chunk-size` | Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when `--lora-backend` is `csgmv`. Larger values may improve performance. | `16` | `16`, `32`, `64`, `128` |
 | `--lora-drain-wait-threshold` | When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default). | `0.0` | Type: float |
+| `--lora-page-rank-size` | Page size (in rank dimension) for paged LoRA memory pool. 0 = disabled (use the existing contiguous LoRAMemoryPool). When enabled (e.g. 8), the pool is organised as fixed-size pages that are allocated and evicted individually, similar to paged attention. | `0` | Type: int |
+| `--lora-pages` | Total physical pages in the paged LoRA pool. 0 = auto-compute from max_loras_per_batch * ceil(max_lora_rank / lora_page_rank_size). Set to a specific value to control the pool size independently. | `0` | Type: int |
+| `--lora-base-priority` | When set, base (non-LoRA) requests are prioritized in the prefill admission order. Base requests are tried first from the waiting queue, LoRA requests fill remaining slots. This addresses queue-level starvation where LoRA requests monopolize all running slots under high load. | `False` | Bool flag (set to enable) |
 
 ## Kernel Backends (Attention, Sampling, Grammar, GEMM)
 | Argument | Description | Defaults | Options |

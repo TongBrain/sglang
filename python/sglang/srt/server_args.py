@@ -529,6 +529,12 @@ class ServerArgs:
     lora_use_virtual_experts: bool = False
     lora_strict_loading: bool = False
     lora_drain_wait_threshold: float = 0.0
+    lora_base_priority: bool = False
+    # Page rank size for paged LoRA memory pool. 0 = disabled (use old MemoryPool).
+    lora_page_rank_size: int = 0
+    # Total physical pages in paged LoRA pool.
+    # 0 = auto (max_loras_per_batch * ceil(max_lora_rank / lora_page_rank_size))
+    lora_pages: int = 0
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -2290,9 +2296,7 @@ class ServerArgs:
                 support_mamba_cache=False,
             )
         elif model_arch in ["NemotronHForCausalLM"]:
-            from sglang.srt.arg_groups.nemotron_h_hook import (
-                apply_nemotron_h_defaults,
-            )
+            from sglang.srt.arg_groups.nemotron_h_hook import apply_nemotron_h_defaults
 
             apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
@@ -5265,6 +5269,23 @@ class ServerArgs:
             help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
         )
         parser.add_argument(
+            "--lora-page-rank-size",
+            default=ServerArgs.lora_page_rank_size,
+            type=int,
+            help="Page size (in rank dimension) for paged LoRA memory pool. "
+            "0 = disabled (use the existing contiguous LoRAMemoryPool). "
+            "When enabled (e.g. 8), the pool is organised as fixed-size pages "
+            "that are allocated and evicted individually, similar to paged attention.",
+        )
+        parser.add_argument(
+            "--lora-pages",
+            default=ServerArgs.lora_pages,
+            type=int,
+            help="Total physical pages in the paged LoRA pool. "
+            "0 = auto-compute from max_loras_per_batch * ceil(max_lora_rank / lora_page_rank_size). "
+            "Set to a small value (e.g. 4, 8, 32) to intentionally trigger page eviction for I7 testing.",
+        )
+        parser.add_argument(
             "--lora-target-modules",
             type=str,
             choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
@@ -5342,6 +5363,16 @@ class ServerArgs:
             type=float,
             default=ServerArgs.lora_drain_wait_threshold,
             help="When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        )
+        parser.add_argument(
+            "--lora-base-priority",
+            action="store_true",
+            default=ServerArgs.lora_base_priority,
+            help="When set, base (non-LoRA) requests are prioritized in the "
+            "prefill admission order. Base requests are tried first from the "
+            "waiting queue, LoRA requests fill remaining slots. This addresses "
+            "queue-level starvation (unlike --lora-base-reserve-slots which "
+            "operates at batch level).",
         )
 
         # Kernel backend
@@ -7177,7 +7208,13 @@ class ServerArgs:
 
             if self.enable_lora_overlap_loading:
                 # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
-                max_loaded_loras_limit = self.max_loras_per_batch * 2
+                if self.lora_page_rank_size > 0:
+                    max_loaded_loras_limit = max(
+                        self.max_loras_per_batch * 2,
+                        (self.lora_pages or self.max_loras_per_batch) * 2,
+                    )
+                else:
+                    max_loaded_loras_limit = self.max_loras_per_batch * 2
                 assert (
                     self.max_loaded_loras is not None
                     and self.max_loaded_loras <= max_loaded_loras_limit
@@ -7286,6 +7323,20 @@ class ServerArgs:
             assert (
                 self.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
+
+            # lora_page_rank_size: 0 = disabled, otherwise must be a power of 2 >= 8.
+            if self.lora_page_rank_size < 0:
+                raise ValueError(
+                    "--lora-page-rank-size must be >= 0. "
+                    f"Got: {self.lora_page_rank_size}"
+                )
+            if self.lora_page_rank_size > 0:
+                ps = self.lora_page_rank_size
+                if ps < 8 or (ps & (ps - 1)) != 0:
+                    raise ValueError(
+                        "--lora-page-rank-size must be 0 (disabled) or a power of 2 "
+                        f">= 8. Got: {ps}"
+                    )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:

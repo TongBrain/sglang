@@ -10,7 +10,12 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["OUTPUT_DIM"])
+    lambda _, kwargs: (
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["OUTPUT_DIM"],
+        kwargs["MAX_RANK"],
+    )
 )
 @triton.jit(do_not_specialize=["num_segs", "output_stride_0", "output_stride_1"])
 def _chunked_lora_expand_kernel(
@@ -171,6 +176,8 @@ def chunked_sgmv_lora_expand_forward(
     M = x.shape[0]
     input_dim = x.shape[1]
     OUTPUT_DIM = weights.shape[1]
+    # MAX_RANK is derived from weights.shape; batch-level rank trimming
+    # is the caller's responsibility.
     MAX_RANK = weights.shape[2]
     num_slices = len(slice_offsets) - 1
     assert input_dim == num_slices * MAX_RANK

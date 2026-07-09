@@ -8,7 +8,12 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["K"], kwargs["NUM_SLICES"], kwargs["BLOCK_M"])
+    lambda _, kwargs: (
+        kwargs["K"],
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["N"],
+    )
 )
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_shrink_kernel(
@@ -141,6 +146,9 @@ def chunked_sgmv_lora_shrink_forward(
     # Block shapes — use auto-tuned config if available, else defaults
     BLOCK_M = batch_info.max_len
     # weights shape is (num_lora, num_slices * rank, input_dim)
+    # N/MAX_RANK are derived from weights.shape, which is static per
+    # memory-pool configuration.  Batch-level rank trimming is the
+    # caller's responsibility (trim weights before passing them in).
     MAX_RANK = weights.shape[1] // num_slices
     config = get_lora_shrink_config(
         K=weights.shape[2], R=MAX_RANK, num_slices=num_slices, chunk_size=BLOCK_M

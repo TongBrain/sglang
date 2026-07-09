@@ -137,6 +137,11 @@ class SchedulerStats:
     lora_pool_slots_used: int = 0
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
+    lora_eviction_events: int = 0
+    lora_total_bytes_evicted: int = 0
+    lora_total_pages: int = 0
+    lora_used_pages: int = 0
+    lora_bytes_moved: int = 0
 
     # HiCache metrics
     hicache_host_used_tokens: int = 0

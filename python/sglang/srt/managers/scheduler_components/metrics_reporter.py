@@ -6,13 +6,7 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -829,9 +823,7 @@ class SchedulerMetricsReporter:
         if not self.scheduler.enable_fpm:
             return
 
-        from sglang.srt.observability.forward_pass_metrics import (
-            ForwardPassMetrics,
-        )
+        from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
 
         if self.scheduler._fpm_uses_device_timer:
             self.forward_pass_device_timer._report()
@@ -881,11 +873,23 @@ class SchedulerMetricsReporter:
         try:
             # Get LoRA memory pool stats
             lora_manager = self.scheduler.tp_worker.model_runner.lora_manager
-            if lora_manager is None or lora_manager.memory_pool is None:
+            if lora_manager is None:
                 return
+            # In paged mode, memory_pool is None — use page_pool instead
+            if lora_manager.memory_pool is None and not getattr(
+                lora_manager, "use_paged_pool", False
+            ):
+                return
+            has_paged = getattr(lora_manager, "use_paged_pool", False)
 
-            mem_pool = lora_manager.memory_pool
-            slots_total = mem_pool.max_loras_per_batch
+            if has_paged:
+                # slots_total comes from the LoRA manager (page count is tracked
+                # separately as gauges via get_eviction_stats below); there is no
+                # flat mem_pool to read max_loras_per_batch from.
+                slots_total = lora_manager.max_loras_per_batch
+            else:
+                mem_pool = lora_manager.memory_pool
+                slots_total = mem_pool.max_loras_per_batch
 
             # Calculate active adapters from running batch
             # This gives a true measure of current load for autoscaling purposes
@@ -913,6 +917,25 @@ class SchedulerMetricsReporter:
             self.stats.lora_pool_slots_used = slots_used
             self.stats.lora_pool_slots_total = slots_total
             self.stats.lora_pool_utilization = utilization
+
+            # Paged LoRA eviction statistics (I7 metric)
+            use_paged = getattr(lora_manager, "use_paged_pool", False)
+            if (
+                use_paged
+                and hasattr(lora_manager, "page_pool")
+                and lora_manager.page_pool is not None
+            ):
+                page_pool = lora_manager.page_pool
+                evict_stats = page_pool.get_eviction_stats()
+                self.stats.lora_eviction_events = evict_stats["eviction_events"]
+                self.stats.lora_total_bytes_evicted = evict_stats["total_bytes_evicted"]
+                self.stats.lora_total_pages = evict_stats["total_pages"]
+                self.stats.lora_used_pages = evict_stats["used_pages"]
+                self.stats.lora_bytes_moved = evict_stats.get("bytes_paged_in", 0)
+            elif (not use_paged) and lora_manager.memory_pool is not None:
+                # Flat: actual bytes copied into slots (adapter's own rank slice).
+                load_stats = lora_manager.memory_pool.get_load_stats()
+                self.stats.lora_bytes_moved = load_stats.get("bytes_loaded", 0)
 
         except Exception as e:
             logger.warning(f"Failed to update LoRA metrics: {e}")

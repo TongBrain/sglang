@@ -48,6 +48,10 @@ class LoRABatchInfo:
     # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
     has_active_lora: bool = False
 
+    # Batch-level max rank (bucket ceiling from scheduler).  Used by
+    # backends to statically shape kernel grid / constexpr parameters.
+    batch_max_rank: int = 0
+
     # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
     # experts which map tokens to requests regardless of the dense-LoRA
     # backend's internal segmentation.  For the triton backend these are
@@ -57,6 +61,19 @@ class LoRABatchInfo:
 
     # Per-request adapter index, shape (bs,).
     req_weight_indices: Optional[torch.Tensor] = None
+
+    # ── Paged-mode fields (B3 / C3) ──────────────────────────────────────
+
+    # Page table for paged kernels, shape (num_adapters_in_batch, max_pages_per_lora)
+    # int32.  Entry [i, j] is the physical page index for adapter slot i,
+    # logical page j, or -1 if swapped out / unused.
+    page_table: Optional[torch.Tensor] = None
+
+    # Max logical pages per adapter in the current batch.
+    max_pages_per_lora: int = 0
+
+    # Page rank size (rows of rank per physical page).
+    page_rank_size: int = 0
 
 
 class LoRAType(Enum):

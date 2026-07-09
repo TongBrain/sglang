@@ -27,6 +27,7 @@ class LoRAOverlapLoader:
             self.load_stream
         )
         self.lora_to_overlap_load_event: Dict[Optional[str], CudaEvent] = {}
+        self.lora_to_overlap_load_start: Dict[Optional[str], float] = {}
 
     def try_overlap_load_lora(
         self, lora_id: Optional[str], running_loras: set[Optional[str]]
@@ -55,13 +56,14 @@ class LoRAOverlapLoader:
             return LoRAOverlapLoadStatus.NOT_LOADED
 
         event = self.lora_to_overlap_load_event[lora_id]
+        start_ts = self.lora_to_overlap_load_start.get(lora_id, 0)
 
         if not event.query():
             return LoRAOverlapLoadStatus.LOADING
 
         torch.cuda.current_stream().wait_event(event)
         del self.lora_to_overlap_load_event[lora_id]
-
+        self.lora_to_overlap_load_start.pop(lora_id, None)
         return LoRAOverlapLoadStatus.LOADED
 
     def _try_start_overlap_load(
@@ -73,10 +75,15 @@ class LoRAOverlapLoader:
         if not self.lora_manager.validate_lora_batch(new_lora_set):
             return False
 
+        import time as _time
+
+        t0 = _time.perf_counter()
         with self.load_stream_context:
-            self.lora_manager.fetch_new_loras({lora_id}, loras_to_be_loaded)
+            if not self.lora_manager.fetch_new_loras({lora_id}, loras_to_be_loaded):
+                return False
             event = self.device_module.Event()
             event.record(self.load_stream)
 
         self.lora_to_overlap_load_event[lora_id] = event
+        self.lora_to_overlap_load_start[lora_id] = t0
         return True

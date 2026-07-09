@@ -149,6 +149,12 @@ class LoRAMemoryPool:
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
 
+        # Actual host->device I/O: bytes actually copied into flat slots. Only
+        # counts real transfers (resident adapter hits skip the copy) — the true
+        # swap-in cost. Flat copies only the adapter's own rank slice (not the
+        # full max_rank slot), so this is the adapter's own byte count per load.
+        self.bytes_loaded: int = 0
+
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # Standard LoRA (3D): [num_loras, rank, hidden_dim]
         # MoE LoRA (4D): [num_loras, num_experts, rank, hidden_dim]
@@ -299,6 +305,14 @@ class LoRAMemoryPool:
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
+
+    def get_load_stats(self) -> dict:
+        """Actual host->device bytes moved into flat slots (swap-in I/O)."""
+        return {
+            "bytes_loaded": self.bytes_loaded,
+            "slots_used": sum(1 for v in self.buffer_id_to_uid if v != EMPTY_SLOT),
+            "slots_total": self.max_loras_per_batch,
+        }
 
     def get_lora_A_shape(
         self,
@@ -673,6 +687,12 @@ class LoRAMemoryPool:
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                logger.info(
+                    "LoRA load (flat): uid=%s buffer_id=%d bytes_loaded=%d",
+                    uid,
+                    buffer_id,
+                    self.bytes_loaded,
+                )
 
     def load_lora_weight_to_buffer(
         self,
@@ -695,6 +715,9 @@ class LoRAMemoryPool:
                     buffer_view.shape == weight.shape
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                 buffer_view.copy_(weight, non_blocking=True)
+                # Actual host->device bytes moved (adapter's own rank slice only;
+                # resident adapters skip this path entirely).
+                self.bytes_loaded += buffer_view.numel() * buffer_view.element_size()
 
         if uid is None:
             for i in range(self.num_layer):

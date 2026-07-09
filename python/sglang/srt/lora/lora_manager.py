@@ -16,6 +16,7 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
+import time
 from typing import Dict, Iterable, List, Optional
 
 import torch
@@ -34,6 +35,7 @@ from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.lora.paged_mem_pool import LoRAPagePool
 from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
     LoRAType,
@@ -71,7 +73,6 @@ class LoRAManager:
             self.base_hf_config: AutoConfig = base_hf_config.get_text_config()
         else:
             self.base_hf_config: AutoConfig = base_hf_config
-        self.max_loras_per_batch: int = max_loras_per_batch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
         self.device: torch.device = next(self.base_model.parameters()).device
@@ -90,6 +91,22 @@ class LoRAManager:
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
         )
+
+        # Paged memory pool (B2)
+        self.page_rank_size: int = server_args.lora_page_rank_size
+        self.use_paged_pool: bool = server_args.lora_page_rank_size > 0
+        # lora_pages is declared on ServerArgs (default 0 = auto), so read it
+        # directly rather than getattr()/or-fallback which could mask a None.
+        self.lora_pages: int = server_args.lora_pages
+        self.page_pool: Optional[LoRAPagePool] = None
+
+        # Paged mode: derive the slot cap (page_table rows) from lora_pages
+        # so admission is purely page-budget-based, not flat-slot-based.
+        # max possible adapters = lora_pages (all r8 = 1 page each) + 1 base.
+        if self.use_paged_pool and self.lora_pages > 0:
+            max_loras_per_batch = self.lora_pages + 1
+        self.max_loras_per_batch: int = max_loras_per_batch
+        self._page_table_cache: Dict[tuple, torch.Tensor] = {}
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -116,9 +133,13 @@ class LoRAManager:
         Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
         """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        pr = self.page_rank_size if self.use_paged_pool else 0
+        rank = self.max_lora_rank if self.use_paged_pool else 0
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
+            page_rank_size=pr,
+            max_lora_rank=rank,
         )
 
     def init_cuda_graph_moe_buffers(
@@ -177,6 +198,26 @@ class LoRAManager:
             # keep metadata for displayed messages
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
+
+            if lora_ref.pinned and self.use_paged_pool and self.page_pool is not None:
+                adapter = self.loras.get(lora_ref.lora_id)
+                if adapter is not None:
+                    if not self.page_pool.pin_adapter(
+                        lora_ref.lora_id, adapter, self.lora_modules
+                    ):
+                        self.page_pool.unpin_adapter(lora_ref.lora_id)
+                        self.page_pool.free_pages(lora_ref.lora_id)
+                        del self.configs[lora_ref.lora_id]
+                        del self.loras[lora_ref.lora_id]
+                        del self.lora_refs[lora_ref.lora_id]
+                        self.num_pinned_loras -= 1
+                        return self.create_lora_update_result(
+                            success=False,
+                            error_message=(
+                                f"Failed to pin adapter {lora_ref.lora_name}: "
+                                "insufficient page budget after pinning."
+                            ),
+                        )
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -223,7 +264,11 @@ class LoRAManager:
             )
 
         # Ensure pinned LoRA adapters does not exceed maximal limit or cause starvation.
-        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
+        if (
+            not self.use_paged_pool
+            and lora_ref.pinned
+            and self.num_pinned_loras >= self.max_loras_per_batch - 1
+        ):
             raise ValueError(
                 f"Failed to load LoRA adapter {lora_ref.lora_name} as a pinned adapter. It is not allowed to pin all slots "
                 "in the LoRA memory pool to avoid starvation for unpinned adapters and base models. Please increase your "
@@ -243,6 +288,9 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
 
         try:
+            if self.use_paged_pool and self.page_pool is not None:
+                self.page_pool.unpin_adapter(lora_ref.lora_id)
+                self.page_pool.free_pages(lora_ref.lora_id)
             del self.configs[lora_ref.lora_id]
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
@@ -256,13 +304,23 @@ class LoRAManager:
         return self.create_lora_update_result(success=True)
 
     def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
-        """
-        Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
-        """
-        if len(lora_ids) > self.max_loras_per_batch:
+        """Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool."""
+        if self.use_paged_pool:
+            if self.page_pool is not None:
+                all_uids = {uid for uid in lora_ids if uid is not None}
+                all_uids |= self.page_pool.pinned_uids
+                total_pages = 0
+                for uid in all_uids:
+                    if uid in self.loras:
+                        total_pages += self.page_pool.get_num_pages_for_rank(
+                            self.loras[uid].config.r
+                        )
+                if total_pages > self.page_pool.total_pages:
+                    return False
+            return True
+        elif len(lora_ids) > self.max_loras_per_batch:
             return False
 
-        # skip pinned LoRA check if no pinned LoRA adapters are loaded.
         if self.num_pinned_loras == 0:
             return True
 
@@ -288,22 +346,41 @@ class LoRAManager:
 
     def fetch_new_loras(
         self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
-    ):
-        # Load active loras into lora memory pool
+    ) -> bool:
         cur_uids = new_loras | running_loras
 
-        assert len(cur_uids) <= self.max_loras_per_batch
-        self.memory_pool.prepare_lora_batch(
-            cur_uids=cur_uids,
-            lora_adapters=self.loras,
-            lora_modules=self.lora_modules,
-            lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
-            lora_embed_tokens_module=self.embed_tokens_module,  # merge into embedding or lora module
-            lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
-        )
+        if not self.use_paged_pool:
+            assert len(cur_uids) <= self.max_loras_per_batch
+
+        if self.use_paged_pool:
+            protected_pages = self.page_pool.get_protected_pages(cur_uids - {None})
+            for uid in cur_uids:
+                if uid is None:
+                    continue
+                if not self.page_pool.ensure_adapter_ready(
+                    uid,
+                    self.loras[uid],
+                    protected_pages,
+                    self.lora_modules,
+                ):
+                    return False
+                protected_pages |= self.page_pool.get_protected_pages({uid})
+            for uid in cur_uids:
+                if uid is not None:
+                    self.page_pool.mark_adapter_pages_accessed(uid)
+        else:
+            self.memory_pool.prepare_lora_batch(
+                cur_uids=cur_uids,
+                lora_adapters=self.loras,
+                lora_modules=self.lora_modules,
+                lora_refs=self.lora_refs.copy(),
+                lora_embed_tokens_module=self.embed_tokens_module,
+                lora_lm_head_module=self.lm_head_module,
+            )
+        return True
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
-        # set up batch info shared by all lora modules
+        t0 = time.perf_counter()
         bs = forward_batch.batch_size
 
         use_cuda_graph = (
@@ -315,14 +392,69 @@ class LoRAManager:
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
-        for i, uid in enumerate(forward_batch.lora_ids):
-            if uid not in self.memory_pool.uid_to_buffer_id:
-                continue
-            weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            if uid is not None:
-                lora = self.loras[uid]
-                lora_ranks[weight_indices[i]] = lora.config.r
-                scalings[weight_indices[i]] = lora.scaling
+
+        if self.use_paged_pool:
+            # Paged mode: assign each adapter a slot in the page_table,
+            # build per-adapter ranks/scalings, and construct the page table.
+            uid_to_slot: dict = {}
+            for uid in forward_batch.lora_ids:
+                if uid is not None and uid not in uid_to_slot:
+                    # Slot 0 is reserved for base-model requests.  Its rank is
+                    # zero and its page-table row stays all -1, so mixed
+                    # base+LoRA batches do not accidentally use the first LoRA.
+                    uid_to_slot[uid] = len(uid_to_slot) + 1
+
+            if len(uid_to_slot) + 1 > self.max_loras_per_batch:
+                raise RuntimeError(
+                    "Paged LoRA: page_table overflow — "
+                    f"{len(uid_to_slot)} LoRA adapters + base need "
+                    f"{len(uid_to_slot) + 1} slots but max_loras_per_batch="
+                    f"{self.max_loras_per_batch}. "
+                    "validate_lora_batch should have prevented this."
+                )
+
+            for i, uid in enumerate(forward_batch.lora_ids):
+                if uid is not None and uid in uid_to_slot:
+                    weight_indices[i] = uid_to_slot[uid]
+
+            num_slots = len(uid_to_slot) + 1
+            lora_ranks = [0] * self.max_loras_per_batch
+            scalings = [0.0] * self.max_loras_per_batch
+
+            for uid, slot in uid_to_slot.items():
+                lora = self.loras.get(uid)
+                if lora is not None:
+                    lora_ranks[slot] = lora.config.r
+                    scalings[slot] = lora.scaling
+
+            # Build page_table tensor for the kernel
+            active_uids = [None] * num_slots
+            for uid, slot in uid_to_slot.items():
+                active_uids[slot] = uid
+            max_pages = self.page_pool.max_pages_per_lora_for_batch(active_uids)
+            cache = getattr(self, "_page_table_cache", None)
+            gen = getattr(self.page_pool, "page_generation", 0)
+            cache_key = (tuple(active_uids), gen)
+            cached_pt = cache.get(cache_key) if cache is not None else None
+            if cached_pt is not None and cached_pt.shape[1] >= max_pages:
+                page_table = cached_pt[:, :max_pages]
+            else:
+                page_table = self.page_pool.build_page_table_tensor(
+                    active_uids, max_pages
+                )
+                if cache is not None:
+                    cache.clear()
+                    cache[cache_key] = page_table
+        else:
+            for i, uid in enumerate(forward_batch.lora_ids):
+                if uid not in self.memory_pool.uid_to_buffer_id:
+                    continue
+                weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+                if uid is not None:
+                    lora = self.loras[uid]
+                    lora_ranks[weight_indices[i]] = lora.config.r
+                    scalings[weight_indices[i]] = lora.scaling
+
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
@@ -332,14 +464,82 @@ class LoRAManager:
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
         )
-        self.lora_backend.batch_info.has_active_lora = any(
-            lora_ranks[wi] > 0 for wi in weight_indices
-        )
+        bi = self.lora_backend.batch_info
+        bi.has_active_lora = any(lora_ranks[wi] > 0 for wi in weight_indices)
+        bi.batch_max_rank = forward_batch.batch_max_rank
+
+        if self.use_paged_pool:
+            if use_cuda_graph and bi.page_table is not None:
+                # CUDA graph: copy into pre-allocated tensor
+                num_slots = page_table.shape[0]
+                max_cols = min(page_table.shape[1], bi.page_table.shape[1])
+                bi.page_table.fill_(-1)
+                bi.page_table[:num_slots, :max_cols].copy_(
+                    page_table[:, :max_cols], non_blocking=True
+                )
+            else:
+                bi.page_table = page_table
+            bi.max_pages_per_lora = max_pages
+            bi.page_rank_size = self.page_rank_size
+
+            def sync_paged_info(batch_info):
+                if batch_info is None:
+                    return
+                batch_info.page_table = bi.page_table
+                batch_info.max_pages_per_lora = max_pages
+                batch_info.page_rank_size = self.page_rank_size
+                batch_info.has_active_lora = bi.has_active_lora
+                batch_info.batch_max_rank = bi.batch_max_rank
+
+            sync_paged_info(getattr(self.lora_backend, "lm_head_batch_info", None))
+            for batch_info in (
+                getattr(self.lora_backend, "lm_head_pass_batch_infos", None) or []
+            ):
+                sync_paged_info(batch_info)
 
     def update_lora_info(self):
         """
         Update all LoRA modules to associate them with the latest memory buffer.
         """
+        if self.use_paged_pool:
+            self._update_lora_info_paged()
+        else:
+            self._update_lora_info_flat()
+
+    def _update_lora_info_paged(self):
+        """Update modules with page storage from the paged memory pool."""
+        pool = self.page_pool
+        for layer_id, layer_modules in enumerate(self.lora_modules):
+            for module_name, module in layer_modules.items():
+                if isinstance(module, FusedMoEWithLoRA):
+                    # FusedMoE paged support deferred to B4+; skip for now.
+                    continue
+
+                target_module = get_target_module_name(module_name, pool.target_modules)
+                if target_module not in pool.A_pages:
+                    continue
+
+                module.set_lora_info_paged(
+                    pool.A_pages[target_module][layer_id],
+                    pool.B_pages[target_module][layer_id],
+                )
+
+        # Update embedding layer if present
+        if self.embed_tokens_module is not None:
+            a_pages = pool.get_embedding_tensor("embed_tokens", is_a=True)
+            b_pages = pool.get_embedding_tensor("embed_tokens", is_a=False)
+            if a_pages is not None and b_pages is not None:
+                self.embed_tokens_module.set_lora_info_paged(a_pages, b_pages)
+
+        # Update lm_head layer if present
+        if self.lm_head_module is not None:
+            a_pages = pool.get_embedding_tensor("lm_head", is_a=True)
+            b_pages = pool.get_embedding_tensor("lm_head", is_a=False)
+            if a_pages is not None and b_pages is not None:
+                self.lm_head_module.set_lora_info_paged(a_pages, b_pages)
+
+    def _update_lora_info_flat(self):
+        """Update modules with flat buffers from the flat memory pool."""
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
                 # Hack for FusedMoE layer
@@ -474,6 +674,21 @@ class LoRAManager:
                     raise RuntimeError(
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
                     )
+            # H2: Log adapter residency summary by rank level
+            # Count from loaded configs (not lora_paths, which may be truncated)
+            from collections import Counter
+
+            rank_counts = Counter()
+            for cfg in self.configs.values():
+                if cfg.r > 0:
+                    rank_counts[cfg.r] += 1
+            total_adapters = len(self.configs)
+            by_rank = ", ".join(f"r{r}={c}" for r, c in sorted(rank_counts.items()))
+            logger.info(
+                "LoRA residency (H2): total_adapters=%d by_rank=[%s]",
+                total_adapters,
+                by_rank,
+            )
 
     def _detect_shared_outer_loras(self) -> bool:
         """Auto-detect shared outer LoRA format from loaded adapter weights.
@@ -694,20 +909,79 @@ class LoRAManager:
 
     def init_memory_pool(self):
         """(Re)initialize the LoRA memory pool based on the current configurations."""
-        self.memory_pool = LoRAMemoryPool(
-            base_hf_config=self.base_hf_config,
-            max_loras_per_batch=self.max_loras_per_batch,
-            dtype=self.dtype,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            max_lora_rank=self.max_lora_rank,
-            target_modules=self.target_modules,
-            base_model=self.base_model,
-            eviction_policy=self.eviction_policy,
-            lora_added_tokens_size=self.lora_added_tokens_size,
-            experts_shared_outer_loras=self.experts_shared_outer_loras,
-            strict_loading=self.lora_strict_loading,
-        )
+        if self.use_paged_pool:
+            # Compute total_pages for the paged pool.
+            pages_per_adapter = (
+                self.max_lora_rank + self.page_rank_size - 1
+            ) // self.page_rank_size
+            if getattr(self, "lora_pages", 0) > 0:
+                self.page_pool_total_pages = self.lora_pages
+            else:
+                # Default: enough pages for max_loras_per_batch max-rank adapters
+                self.page_pool_total_pages = (
+                    pages_per_adapter * self.max_loras_per_batch
+                )
+            if self.page_pool_total_pages < pages_per_adapter:
+                raise ValueError(
+                    f"--lora-pages={self.page_pool_total_pages} is too small. "
+                    f"A rank-{self.max_lora_rank} adapter needs {pages_per_adapter} pages "
+                    f"(page_rank_size={self.page_rank_size}). "
+                    f"Set --lora-pages >= {pages_per_adapter}."
+                )
+            # Ensure the slot cap (page_table rows, lora_ranks/scalings array
+            # size) can hold the max possible adapters: one page each + base.
+            derived_max = self.page_pool_total_pages + 1
+            if self.max_loras_per_batch < derived_max:
+                self.max_loras_per_batch = derived_max
+                if self.lora_backend is not None:
+                    self.lora_backend.max_loras_per_batch = derived_max
+            max_adapters = self.page_pool_total_pages // pages_per_adapter
+            logger.info(
+                "Paged pool: total_pages=%d (holds %d r%d adapters, max_loras_per_batch=%d)",
+                self.page_pool_total_pages,
+                max_adapters,
+                self.max_lora_rank,
+                self.max_loras_per_batch,
+            )
+            self.page_pool = LoRAPagePool(
+                total_pages=self.page_pool_total_pages,
+                dtype=self.dtype,
+                device=self.device,
+                target_modules=self.target_modules,
+                num_layers=self.base_hf_config.num_hidden_layers,
+                base_model=self.base_model,
+                page_rank_size=self.page_rank_size,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                max_lora_rank=self.max_lora_rank,
+                max_loras_per_batch=self.max_loras_per_batch,
+            )
+            for lora_id, lora_ref in self.lora_refs.items():
+                if not lora_ref.pinned:
+                    continue
+                adapter = self.loras.get(lora_id)
+                if adapter is None:
+                    continue
+                if not self.page_pool.pin_adapter(lora_id, adapter, self.lora_modules):
+                    raise RuntimeError(
+                        f"Failed to pin adapter {lora_ref.lora_name or lora_id} "
+                        "during init_memory_pool: insufficient page budget."
+                    )
+        else:
+            self.memory_pool = LoRAMemoryPool(
+                base_hf_config=self.base_hf_config,
+                max_loras_per_batch=self.max_loras_per_batch,
+                dtype=self.dtype,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                max_lora_rank=self.max_lora_rank,
+                target_modules=self.target_modules,
+                base_model=self.base_model,
+                eviction_policy=self.eviction_policy,
+                lora_added_tokens_size=self.lora_added_tokens_size,
+                experts_shared_outer_loras=self.experts_shared_outer_loras,
+                strict_loading=self.lora_strict_loading,
+            )
 
         # Initializing memory pool with base model
         self.fetch_new_loras({None})

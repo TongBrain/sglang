@@ -141,10 +141,16 @@ class SchedulerLoadInquirer:
         lora = None
         if include_all or "lora" in include:
             if self.server_args.enable_lora:
+                stats = self.get_stats()
                 lora = LoRAMetrics(
-                    slots_used=self.get_stats().lora_pool_slots_used,
-                    slots_total=self.get_stats().lora_pool_slots_total,
-                    utilization=self.get_stats().lora_pool_utilization,
+                    slots_used=stats.lora_pool_slots_used,
+                    slots_total=stats.lora_pool_slots_total,
+                    utilization=stats.lora_pool_utilization,
+                    eviction_events=stats.lora_eviction_events,
+                    total_bytes_evicted=stats.lora_total_bytes_evicted,
+                    total_pages=stats.lora_total_pages,
+                    used_pages=stats.lora_used_pages,
+                    bytes_moved=stats.lora_bytes_moved,
                 )
 
         disaggregation = None
