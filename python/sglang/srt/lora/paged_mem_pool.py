@@ -387,6 +387,7 @@ class LoRAPagePool:
             if len(evicted) >= num_pages_needed:
                 break
             uid = getattr(self, "phys_page_to_uid", {}).get(p)
+            logic_idx = -1
             if uid is not None and uid in self.page_table:
                 pt = self.page_table[uid]
                 for logic_idx, phys_idx in enumerate(pt):
@@ -649,8 +650,8 @@ class LoRAPagePool:
                     w_src = w_src[out_offset : out_offset + page_output_dim, :]
                 dst = target[phys, :, : w_src.shape[-1]]
                 dst.copy_(w_src, non_blocking=True)
-                if scaling != 1.0:
-                    dst.mul_(scaling)
+                # if scaling != 1.0:
+                #     dst.mul_(scaling)
                 self.bytes_paged_in += w_src.numel() * w_src.element_size()
             else:
                 target[phys, :, : (r_end - r_start)].zero_()

@@ -133,14 +133,18 @@ class LoRAManager:
         Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
         """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        pr = self.page_rank_size if self.use_paged_pool else 0
-        rank = self.max_lora_rank if self.use_paged_pool else 0
-        self.lora_backend.init_cuda_graph_batch_info(
-            max_bs_in_cuda_graph=max_bs_in_cuda_graph,
-            num_tokens_per_bs=num_tokens_per_bs,
-            page_rank_size=pr,
-            max_lora_rank=rank,
-        )
+        if self.use_paged_pool:
+            self.lora_backend.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+                num_tokens_per_bs=num_tokens_per_bs,
+                page_rank_size=self.page_rank_size,
+                max_lora_rank=self.max_lora_rank,
+            )
+        else:
+            self.lora_backend.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+                num_tokens_per_bs=num_tokens_per_bs,
+            )
 
     def init_cuda_graph_moe_buffers(
         self, max_bs: int, max_loras: int, compute_dtype, moe_layer
