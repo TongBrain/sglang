@@ -138,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetLoRAAdapterStatusReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -149,6 +150,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoRAAdapterStatusOutput,
+    LoRAUpdateOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -1644,6 +1647,7 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (GetLoRAAdapterStatusReqInput, self.get_lora_adapter_status),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -5065,24 +5069,67 @@ class Scheduler(
     ) -> LoadLoRAAdapterReqOutput:
         """In-place loading a new lora adapter from disk or huggingface."""
 
-        result = self.tp_worker.load_lora_adapter(recv_req)
-        return result
+        return self._run_lora_update(lambda: self.tp_worker.load_lora_adapter(recv_req))
 
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ) -> LoadLoRAAdapterFromTensorsReqOutput:
         """In-place loading a new lora adapter from serialized tensors."""
 
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
-        return result
+        return self._run_lora_update(
+            lambda: self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+        )
 
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
-        result = self.tp_worker.unload_lora_adapter(recv_req)
-        return result
+        if recv_req.missing_ok:
+            return self._run_lora_update(
+                lambda: self.tp_worker.model_runner.lora_manager.discard_lora_adapter(
+                    recv_req.lora_id
+                )
+            )
+        return self._run_lora_update(
+            lambda: self.tp_worker.unload_lora_adapter(recv_req)
+        )
+
+    def _run_lora_update(self, action):
+        # Every rank must enter the collective even if tensor decoding or
+        # failed-load cleanup raises before the LoRAManager returns a reply.
+        try:
+            result = action()
+        except Exception as e:
+            result = LoRAUpdateOutput(success=False, error_message=str(e))
+        return self._collect_lora_update_result(result)
+
+    def _collect_lora_update_result(self, result):
+        from sglang.srt.lora.lifecycle import merge_lora_update_results
+
+        replies = [None] * torch.distributed.get_world_size(self.dp_tp_cpu_group)
+        torch.distributed.all_gather_object(replies, result, group=self.dp_tp_cpu_group)
+        return merge_lora_update_results(replies)
+
+    def get_lora_adapter_status(self, recv_req: GetLoRAAdapterStatusReqInput):
+        try:
+            manager = self.tp_worker.model_runner.lora_manager
+            worker = manager.get_adapter_status(recv_req.lora_name)
+        except Exception as e:
+            worker = {"adapters": {}, "error_message": str(e)}
+        worker.update(
+            tp_rank=self.ps.tp_rank,
+            pp_rank=self.ps.pp_rank,
+            dp_rank=self.ps.dp_rank,
+        )
+        workers = [None] * torch.distributed.get_world_size(self.dp_tp_cpu_group)
+        torch.distributed.all_gather_object(workers, worker, group=self.dp_tp_cpu_group)
+        errors = [w["error_message"] for w in workers if "error_message" in w]
+        return LoRAAdapterStatusOutput(
+            success=not errors,
+            error_message=" | ".join(dict.fromkeys(errors)) or None,
+            workers=workers,
+        )
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput

@@ -145,21 +145,19 @@ class LoRARegistry:
         if isinstance(lora_name, str):
             async with self._registry_lock.writer_lock:
                 lora_id = _lookup(lora_name)
-
-            await self._counters[lora_id].increment(notify_all=False)
+                await self._counters[lora_id].increment(notify_all=False)
             return lora_id
         elif isinstance(lora_name, list):
             async with self._registry_lock.writer_lock:
                 lora_ids = [_lookup(name) for name in lora_name]
-
-            # Increment the counters only after all IDs are looked up.
-            await asyncio.gather(
-                *[
-                    self._counters[id].increment(notify_all=False)
-                    for id in lora_ids
-                    if id is not None
-                ]
-            )
+                # Lookup and retain must be atomic with respect to unregister.
+                await asyncio.gather(
+                    *[
+                        self._counters[id].increment(notify_all=False)
+                        for id in lora_ids
+                        if id is not None
+                    ]
+                )
             return lora_ids
         else:
             raise TypeError("lora_name must be either a string or a list of strings.")
@@ -191,8 +189,8 @@ class LoRARegistry:
         This method itself is not synchronized, which is safe because it should only be called during LoRA unloading,
         which itself is guaranteed to be sequential.
         """
-        assert (
-            lora_id not in self._registry
+        assert all(
+            ref.lora_id != lora_id for ref in self._registry.values()
         ), "wait_for_unload should only be called after the LoRA adapter has been unregistered. "
         assert (
             lora_id in self._counters
@@ -261,3 +259,11 @@ class LoRARegistry:
             Dict[str, LoRARef]: A dictionary mapping LoRA names to LoRARef objects.
         """
         return dict(self._registry)
+
+    async def snapshot(self):
+        """Registered identities and advisory in-flight counts without LRU mutation."""
+        async with self._registry_lock.reader_lock:
+            return {
+                name: (ref, self._counters[ref.lora_id].value())
+                for name, ref in self._registry.items()
+            }

@@ -278,12 +278,71 @@ class LoRAManager:
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
+            self.discard_lora_adapter(lora_ref.lora_id)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
             )
 
         return self.create_lora_update_result(success=True)
+
+    def discard_lora_adapter(self, lora_id: str) -> LoRAUpdateOutput:
+        """Idempotently remove unpublished state after a failed distributed load."""
+        pending_event = self.pending_lora_load_events.pop(lora_id, None)
+        if pending_event is not None:
+            pending_event.synchronize()
+        slot = self.memory_pool.remove_lora(lora_id)
+        if slot is not None:
+            self._notify_lora_slots_updated({slot})
+        if self.page_pool is not None:
+            self.page_pool.free_pages(lora_id)
+        ref = self.lora_refs.pop(lora_id, None)
+        if ref is not None:
+            self.num_pinned_loras -= int(ref.pinned)
+        self.configs.pop(lora_id, None)
+        self.loras.pop(lora_id, None)
+        return self.create_lora_update_result(success=True)
+
+    def get_adapter_status(self, lora_name: Optional[str] = None) -> Dict:
+        """Inspect CPU metadata and GPU residency without copying weights."""
+        adapters = {}
+        for uid, ref in self.lora_refs.items():
+            if lora_name is not None and ref.lora_name != lora_name:
+                continue
+            config = self.configs[uid]
+            pool = self.page_pool
+            if pool is not None:
+                required = pool.get_num_pages_for_rank(config.r)
+                resident_pages = sum(p >= 0 for p in pool.page_table.get(uid, []))
+                resident = pool.is_complete(uid, config.r)
+            else:
+                required = resident_pages = None
+                resident = uid in self.memory_pool.uid_to_buffer_id
+            pending = self.pending_lora_load_events.get(uid)
+            if pending is not None and not pending.query():
+                resident = False
+            adapters[ref.lora_name] = {
+                "lora_id": uid,
+                "rank": config.r,
+                "target_modules": (
+                    sorted(config.target_modules)
+                    if not isinstance(config.target_modules, str)
+                    else config.target_modules
+                ),
+                "pinned": bool(ref.pinned),
+                "resident": resident,
+                "required_pages": required,
+                "resident_pages": resident_pages,
+            }
+        return {
+            "adapters": adapters,
+            "paged": self.use_paged_pool,
+            "total_pages": self.page_pool.total_pages if self.page_pool else None,
+            "free_pages": (
+                len(self.page_pool.free_page_indices) if self.page_pool else None
+            ),
+            "page_rank_size": self.page_pool.PAGE_RANK_SIZE if self.page_pool else None,
+        }
 
     def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
         """
@@ -1053,6 +1112,7 @@ class LoRAManager:
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
+            self.discard_lora_adapter(lora_ref.lora_id)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),

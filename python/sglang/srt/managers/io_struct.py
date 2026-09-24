@@ -2267,6 +2267,8 @@ class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
     lora_name: str
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
+    # Used by failed-load rollback; an absent adapter is already cleaned up.
+    missing_ok: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
@@ -2303,6 +2305,25 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+    lora_id: Optional[str] = None
+
+
+class GetLoRAAdapterStatusReqInput(BaseReq, kw_only=True):
+    lora_name: Optional[str] = None
+
+
+class LoRAAdapterStatusOutput(BaseReq, kw_only=True):
+    success: bool
+    error_message: Optional[str] = None
+    adapters: Dict[str, Any] = msgspec.field(default_factory=dict)
+    workers: List[Dict[str, Any]] = msgspec.field(default_factory=list)
+    probe_completed: bool = False
+
+
+class PrewarmLoRAAdapterReqInput(BaseReq, kw_only=True):
+    lora_name: str
+    # Caller-supplied valid prompt tokens for a one-token canary forward.
+    input_ids: List[int]
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (

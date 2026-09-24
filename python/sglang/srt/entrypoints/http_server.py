@@ -125,6 +125,7 @@ from sglang.srt.managers.io_struct import (
     DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetLoRAAdapterStatusReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -133,6 +134,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PrewarmLoRAAdapterReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -1551,6 +1553,7 @@ async def load_lora_adapter(
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
@@ -1571,6 +1574,32 @@ async def unload_lora_adapter(
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/get_lora_adapter_status", methods=["GET"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_lora_adapter_status(request: Request, lora_name: Optional[str] = None):
+    """Query registered identity and per-worker residency (a point-in-time snapshot)."""
+    result = await _global_state.tokenizer_manager.get_lora_adapter_status(
+        GetLoRAAdapterStatusReqInput(lora_name=lora_name), request
+    )
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/prewarm_lora_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prewarm_lora_adapter(
+    obj: Annotated[PrewarmLoRAAdapterReqInput, Body()], request: Request
+):
+    """Run a one-token canary through normal scheduling, then report residency."""
+    result = await _global_state.tokenizer_manager.prewarm_lora_adapter(obj, request)
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])

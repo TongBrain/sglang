@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
+from sglang.srt.lora.lifecycle import (
+    merge_adapter_status,
+)
+from sglang.srt.lora.lifecycle import (
+    merge_lora_update_results as _merge_lora_update_results,
+)
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -32,8 +38,10 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetLoRAAdapterStatusReqInput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -46,8 +54,10 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoRAAdapterStatusOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PrewarmLoRAAdapterReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -126,30 +136,10 @@ _COMMUNICATOR_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
+    ("lora_adapter_status", LoRAAdapterStatusOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
-
-
-def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOutput:
-    """Merge the per-rank replies of a LoRA load/unload fan-out into one result.
-
-    The operation succeeded only if every rank succeeded. Reporting a partial
-    failure as success would let the tokenizer-side LoRA registry drift from
-    the ranks that failed, so failures win: their deduplicated error messages
-    are joined, and loaded_adapters reflects the first failed rank.
-    """
-    failed = [r for r in results if not r.success]
-    if not failed:
-        return results[0]
-    error_messages = list(
-        dict.fromkeys(r.error_message for r in failed if r.error_message)
-    )
-    return LoRAUpdateOutput(
-        success=False,
-        error_message=" | ".join(error_messages),
-        loaded_adapters=failed[0].loaded_adapters,
-    )
 
 
 class TokenizerControlMixin:
@@ -603,6 +593,7 @@ class TokenizerControlMixin:
         result = _merge_lora_update_results(
             await self.update_lora_adapter_communicator(obj)
         )
+        result.lora_id = lora_id
 
         return result
 
@@ -630,6 +621,7 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                self._validate_lora_load_name(obj.lora_name)
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -642,11 +634,14 @@ class TokenizerControlMixin:
                 result = _merge_lora_update_results(
                     await self.update_lora_adapter_communicator(obj)
                 )
+                if not result.success:
+                    return await self._rollback_failed_lora_load(obj, result)
 
                 # Register the LoRA adapter only after loading is successful.
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                    result.lora_id = new_adapter.lora_id
 
                 if self.server_args.max_loaded_loras is not None:
                     while (
@@ -712,6 +707,7 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                self._validate_lora_load_name(obj.lora_name)
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
@@ -721,10 +717,13 @@ class TokenizerControlMixin:
                 result = _merge_lora_update_results(
                     await self.update_lora_adapter_communicator(obj)
                 )
+                if not result.success:
+                    return await self._rollback_failed_lora_load(obj, result)
 
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                    result.lora_id = new_adapter.lora_id
                 if self.server_args.max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
@@ -762,6 +761,105 @@ class TokenizerControlMixin:
                 error_message=str(e),
             )
 
+    def _validate_lora_load_name(self, name):
+        if not name or not name.strip():
+            raise ValueError("lora_name must not be empty")
+        if name in self.lora_registry.get_all_adapters():
+            raise ValueError(
+                f"LoRA adapter {name} is already loaded; use an immutable versioned name"
+            )
+        limit = self.server_args.max_loaded_loras
+        refs = self.lora_registry.get_all_adapters()
+        if (
+            limit is not None
+            and len(refs) >= limit
+            and (limit == 0 or all(ref.pinned for ref in refs.values()))
+        ):
+            raise ValueError(
+                "No unpinned adapter can be evicted within max_loaded_loras"
+            )
+
+    async def _rollback_failed_lora_load(self, obj, result):
+        rollback = _merge_lora_update_results(
+            await self.update_lora_adapter_communicator(
+                UnloadLoRAAdapterReqInput(
+                    lora_name=obj.lora_name, lora_id=obj.lora_id, missing_ok=True
+                )
+            )
+        )
+        if not rollback.success:
+            result.error_message = (
+                f"{result.error_message}; rollback failed: {rollback.error_message}"
+            )
+        result.loaded_adapters = {
+            name: ref.lora_path
+            for name, ref in self.lora_registry.get_all_adapters().items()
+        }
+        return result
+
+    async def _get_lora_adapter_status_locked(self, obj):
+        results = await self.lora_adapter_status_communicator(obj)
+        return merge_adapter_status(
+            results, await self.lora_registry.snapshot(), obj.lora_name
+        )
+
+    def _validate_lora_status_available(self):
+        if not get_lora().enable_lora:
+            raise ValueError("LoRA is not enabled; set --enable-lora")
+        parallel = get_parallel().config
+        if parallel.pp_size != 1:
+            raise ValueError("LoRA status/prewarm currently requires pp_size=1")
+        if parallel.dp_size != 1 and not parallel.enable_dp_attention:
+            raise ValueError("LoRA status/prewarm requires DP attention or dp_size=1")
+
+    async def get_lora_adapter_status(self, obj, request=None):
+        self.auto_create_handle_loop()
+        try:
+            self._validate_lora_status_available()
+            async with self.lora_update_lock:
+                return await self._get_lora_adapter_status_locked(obj)
+        except ValueError as e:
+            return LoRAAdapterStatusOutput(success=False, error_message=str(e))
+
+    async def prewarm_lora_adapter(self, obj: PrewarmLoRAAdapterReqInput, request=None):
+        self.auto_create_handle_loop()
+        try:
+            self._validate_lora_status_available()
+            if not obj.input_ids:
+                raise ValueError("input_ids must contain valid prompt tokens")
+            # Hold the update lock through the canary so its name cannot be
+            # unregistered/reused. Normal scheduling protects in-flight pages.
+            async with self.lora_update_lock:
+                if obj.lora_name not in self.lora_registry.get_all_adapters():
+                    raise ValueError(f"LoRA adapter {obj.lora_name} is not registered")
+                for dp_rank in range(self.elastic_worker_count):
+                    probe = GenerateReqInput(
+                        input_ids=obj.input_ids,
+                        lora_path=obj.lora_name,
+                        routed_dp_rank=dp_rank,
+                        sampling_params={"max_new_tokens": 1, "temperature": 0},
+                        stream=False,
+                    )
+                    completed = False
+                    generator = self.generate_request(probe, request)
+                    try:
+                        async for output in generator:
+                            reason = output.get("meta_info", {}).get("finish_reason")
+                            if not reason or reason.get("type") == "abort":
+                                raise ValueError(f"LoRA prewarm probe failed: {reason}")
+                            completed = True
+                    finally:
+                        await generator.aclose()
+                    if not completed:
+                        raise ValueError("LoRA prewarm probe returned no completion")
+                result = await self._get_lora_adapter_status_locked(
+                    GetLoRAAdapterStatusReqInput(lora_name=obj.lora_name)
+                )
+                result.probe_completed = True
+                return result
+        except ValueError as e:
+            return LoRAAdapterStatusOutput(success=False, error_message=str(e))
+
     async def unload_lora_adapter(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -789,6 +887,11 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if (
+                    obj.missing_ok
+                    and obj.lora_name not in self.lora_registry.get_all_adapters()
+                ):
+                    return UnloadLoRAAdapterReqOutput(success=True)
                 return await self._unload_lora_adapter_locked(obj)
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
